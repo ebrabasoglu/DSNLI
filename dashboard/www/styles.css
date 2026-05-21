@@ -68,6 +68,10 @@ body {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.metric-grid.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .metric-card {
   background: #ffffff;
   border: 1px solid #e4e7ec;
@@ -153,16 +157,32 @@ body {
   margin-top: 20px;
 }
 
-.simulator-layout {
+.flow-row {
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 18px;
-  align-items: start;
+  margin: 18px 0;
 }
 
-.input-panel {
-  position: sticky;
-  top: 76px;
+.flow-step {
+  background: #ffffff;
+  border: 1px solid #d9e3ea;
+  border-left: 4px solid #116e8a;
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+}
+
+.flow-step h4 {
+  margin: 0 0 8px;
+  color: #17324d;
+  font-size: 1rem;
+  font-weight: 800;
+}
+
+.flow-step p {
+  margin: 0;
+  color: #475467;
 }
 
 .source-note {
@@ -177,14 +197,11 @@ table {
 
 @media (max-width: 1000px) {
   .metric-grid.four,
+  .metric-grid.three,
   .two-col,
   .story-grid,
-  .simulator-layout {
+  .flow-row {
     grid-template-columns: 1fr;
-  }
-
-  .input-panel {
-    position: static;
   }
 }
 
