@@ -35,7 +35,9 @@ install.packages("rsconnect")
 Then deploy from the repository root:
 
 ```r
+dir.create("dashboard/data", showWarnings = FALSE)
+file.copy("assignment_data.csv", "dashboard/data/assignment_data.csv", overwrite = TRUE)
 rsconnect::deployApp("dashboard")
 ```
 
-If deploying to a service where the parent repository files are not bundled, either deploy from the repository root with `assignment_data.csv` included or copy the CSV into `dashboard/data/assignment_data.csv`.
+The copied CSV is ignored by Git so the repository does not store the 11 MB dataset twice.
