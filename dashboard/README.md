@@ -27,7 +27,11 @@ The app reads `assignment_data.csv` from the repository root when available. The
 
 ## Deploy
 
-Install the deployment package once:
+For Posit Connect Cloud GitHub deployments, use the repository root. The root
+`app.R` loads the dashboard app and `manifest.json` tells Connect Cloud which R
+packages to install.
+
+Install the deployment package once if deploying from R:
 
 ```r
 install.packages("rsconnect")
@@ -36,9 +40,5 @@ install.packages("rsconnect")
 Then deploy from the repository root:
 
 ```r
-dir.create("dashboard/data", showWarnings = FALSE)
-file.copy("assignment_data.csv", "dashboard/data/assignment_data.csv", overwrite = TRUE)
-rsconnect::deployApp("dashboard")
+rsconnect::deployApp(".")
 ```
-
-The copied CSV is ignored by Git so the repository does not store the 11 MB dataset twice.

@@ -12,6 +12,18 @@ RED <- "#C53030"
 
 default_loading <- 0.1948
 
+asset_dir <- if (dir.exists("www")) {
+  "www"
+} else if (dir.exists(file.path("dashboard", "www"))) {
+  file.path("dashboard", "www")
+} else {
+  "www"
+}
+
+if (dir.exists(asset_dir)) {
+  addResourcePath("dash-assets", normalizePath(asset_dir, winslash = "/", mustWork = FALSE))
+}
+
 kpis <- list(
   policies = 163657,
   zero_claim_rate = 0.89,
@@ -342,7 +354,7 @@ ui <- navbarPage(
   id = "section",
   theme = bs_theme(version = 5, bootswatch = "flatly", primary = KUL_TEAL),
   header = tagList(
-    tags$head(tags$link(rel = "stylesheet", type = "text/css", href = "styles.css")),
+    tags$head(tags$link(rel = "stylesheet", type = "text/css", href = "dash-assets/styles.css")),
     div(
       class = "hero-band",
       div(
