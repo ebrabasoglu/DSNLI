@@ -1,0 +1,1295 @@
+---
+title: "Data Science For Non-Life Insurance"
+subtitle: "Assignment"
+author: "Bruno Tegbesa, Eliseo Montana & Ebra Basoglu"
+date: "May 18, 2026"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  fig.align  = "center"
+)
+```
+
+```{r install-packages, include=FALSE}
+pkgs <- c("tidyverse", "MASS", "mgcv", "gbm", "pdp", "classInt", "rpart",
+          "readxl", "gridExtra", "knitr", "kableExtra", "scales", "viridis", "broom")
+new  <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
+
+if (!"devtools" %in% rownames(installed.packages()))
+  install.packages("devtools", repos = "https://cloud.r-project.org")
+```
+
+```{r libraries}
+library(MASS)
+library(tidyverse)
+library(mgcv)
+library(gbm)
+library(pdp)
+library(classInt)
+library(rpart)
+library(readxl)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(viridis)
+library(broom)
+
+KULbg <- "#116E8A"
+```
+
+# Data Loading and Preprocessing
+
+## Load Data
+
+```{r load-data}
+url      <- "https://raw.githubusercontent.com/katrienantonio/IABE-DS-module-1/main/assignment/assignment_data.csv"
+dat_raw  <- read.csv(url, stringsAsFactors = FALSE)
+
+inspost  <- read_excel(
+  "~/OneDrive/Documenten/Data Science for Non-Life Insurance/inspost.xls"
+) %>%
+  rename_all(tolower) %>%           # ins, commune, lat, long, codposs
+  select(codposs, lat, long)
+
+cat("Policies:", nrow(dat_raw), "\n")
+cat("Postal-code reference rows:", nrow(inspost), "\n")
+```
+
+## Variable Definitions
+
+| Variable | Description | Type |
+|---|---|---|
+| AGEPH | Age of policyholder | Continuous |
+| CODPOSS | Belgian postal code | Categorical / spatial key |
+| duree / lnexpo | Exposure (years) / log-exposure | Continuous |
+| nbrtotc | Total claim count — **frequency target** | Count |
+| chargtot | Total claim cost (EUR) — **severity aggregate** | Continuous |
+| agecar | Vehicle age (0-1, 2-5, 6-10, >10) | Categorical |
+| sexp | Gender | Categorical |
+| fuelc | Fuel type | Categorical |
+| split | Premium payment frequency | Categorical |
+| usec | Vehicle use | Categorical |
+| fleetc / sportc | Fleet / sport car indicator | Categorical |
+| coverp | Coverage level | Categorical |
+| powerc | Engine power | Categorical |
+
+## Preprocessing
+
+```{r preprocessing}
+dat <- dat_raw %>%
+  left_join(inspost, by = c("CODPOSS" = "codposs")) %>%
+  mutate(
+    agecar = factor(agecar, levels = c("6-10", "0-1",   "2-5",    ">10")),
+    sexp   = factor(sexp,   levels = c("Male",  "Female")),
+    fuelc  = factor(fuelc,  levels = c("Petrol","Gasoil")),
+    split  = factor(split,  levels = c("Once",  "Twice", "Monthly","Thrice")),
+    usec   = factor(usec,   levels = c("Private","Professional")),
+    fleetc = factor(fleetc, levels = c("No",    "Yes")),
+    sportc = factor(sportc, levels = c("No",    "Yes")),
+    coverp = factor(coverp, levels = c("MTPL",  "MTPL+", "MTPL+++")),
+    powerc = factor(powerc, levels = c("<66",   "66-110",">110")),
+
+    avg_claim = ifelse(nbrtotc > 0, chargtot / nbrtotc, NA_real_)
+  )
+
+glimpse(dat)
+```
+
+## Train/Test Split (80 / 20)
+
+```{r split}
+set.seed(42)
+train_idx <- sample(nrow(dat), floor(0.8 * nrow(dat)))
+train     <- dat[ train_idx, ]
+test      <- dat[-train_idx, ]
+train_sev <- filter(train, nbrtotc > 0)
+test_sev  <- filter(test,  nbrtotc > 0)
+cat("Train:", nrow(train), "| Test:", nrow(test),
+    "| Train claims:", nrow(train_sev), "| Test claims:", nrow(test_sev), "\n")
+```
+
+# Exploratory Data Analysis
+
+## Portfolio Overview
+
+```{r eda-overview}
+tibble(
+  Statistic = c("Policies", "Total exposure (yrs)", "Policies with ≥1 claim",
+                "Empirical claim frequency", "Total claim cost (EUR)",
+                "Mean severity (EUR | claim > 0)"),
+  Value = c(
+    format(nrow(dat), big.mark = ","),
+    format(round(sum(dat$duree), 0), big.mark = ","),
+    format(sum(dat$nbrtotc > 0), big.mark = ","),
+    paste0(round(100 * sum(dat$nbrtotc) / sum(dat$duree), 3), "%"),
+    format(round(sum(dat$chargtot), 0), big.mark = ","),
+    format(round(mean(dat$avg_claim, na.rm = TRUE), 2), big.mark = ",")
+  )
+) %>%
+  kable(caption = "Dataset Overview") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Frequency and Severity Distributions
+
+```{r eda-dist, fig.height=4}
+p_nclaims <- ggplot(dat, aes(nbrtotc)) + theme_bw() +
+  geom_bar(aes(y = after_stat(count/sum(count))), col = KULbg, fill = KULbg, alpha = .5) +
+  labs(x = "Number of claims", y = "Relative frequency",
+       title = "Distribution of claim counts")
+
+p_expo <- ggplot(dat, aes(duree)) + theme_bw() +
+  geom_histogram(aes(y = after_stat(count/sum(count))), bins = 60,
+                 col = KULbg, fill = KULbg, alpha = .5) +
+  labs(x = "Exposure (years)", y = "Relative frequency",
+       title = "Distribution of exposure")
+
+p_sev <- dat %>% filter(nbrtotc > 0) %>%
+  ggplot(aes(avg_claim)) + theme_bw() +
+  geom_density(adjust = 2, col = KULbg, fill = KULbg, alpha = .5) +
+  coord_cartesian(xlim = c(0, 10000)) +
+  labs(x = "Avg claim cost (EUR)", y = "Density",
+       title = "Severity distribution (claims only)")
+
+grid.arrange(p_nclaims, p_expo, p_sev, ncol = 3)
+```
+
+## Risk Factor Distributions
+
+```{r eda-factors, fig.height=7}
+ggplot.bar <- function(DT, variable, xlab){
+  ggplot(DT, aes(as.factor({{variable}}))) + theme_bw() +
+    geom_bar(aes(y = after_stat(count/sum(count))),
+             col = KULbg, fill = KULbg, alpha = .5) +
+    labs(x = xlab, y = "Relative frequency")
+}
+
+ggplot.hist <- function(DT, variable, xlab, binwidth){
+  ggplot(DT, aes({{variable}})) + theme_bw() +
+    geom_histogram(aes(y = after_stat(count/sum(count))), binwidth = binwidth,
+                   col = KULbg, fill = KULbg, alpha = .5) +
+    labs(x = xlab, y = "Relative frequency")
+}
+
+p1  <- ggplot.bar( dat, agecar,  "agecar")
+p2  <- ggplot.bar( dat, sexp,    "sexp")
+p3  <- ggplot.bar( dat, fuelc,   "fuelc")
+p4  <- ggplot.bar( dat, split,   "split")
+p5  <- ggplot.bar( dat, usec,    "usec")
+p6  <- ggplot.bar( dat, fleetc,  "fleetc")
+p7  <- ggplot.bar( dat, sportc,  "sportc")
+p8  <- ggplot.bar( dat, coverp,  "coverp")
+p9  <- ggplot.bar( dat, powerc,  "powerc")
+p10 <- ggplot.hist(dat, AGEPH,   "AGEPH", 2)
+
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, ncol = 4)
+```
+
+## Empirical Claim Frequency
+
+```{r eda-emp-freq, fig.height=5}
+emp_freq_plot <- function(df, var, lbl){
+  df %>%
+    group_by(across(all_of(var))) %>%
+    summarise(emp_freq = sum(nbrtotc) / sum(duree), .groups = "drop") %>%
+    rename(level = 1) %>%
+    mutate(level = as.character(level)) %>%
+    ggplot(aes(x = reorder(level, emp_freq), y = emp_freq)) + theme_bw() +
+    geom_col(col = KULbg, fill = KULbg, alpha = .6) +
+    coord_flip() +
+    scale_y_continuous(labels = percent) +
+    labs(x = NULL, y = "Emp. freq.", title = lbl)
+}
+
+grid.arrange(
+  emp_freq_plot(dat, "agecar",  "Vehicle age"),
+  emp_freq_plot(dat, "coverp",  "Coverage"),
+  emp_freq_plot(dat, "powerc",  "Power"),
+  emp_freq_plot(dat, "sexp",    "Gender"),
+  emp_freq_plot(dat, "fuelc",   "Fuel"),
+  emp_freq_plot(dat, "usec",    "Use"),
+  ncol = 3
+)
+```
+
+## Age of Policyholder
+
+```{r eda-age, fig.height=4}
+p_age_hist <- ggplot.hist(dat, AGEPH, "AGEPH", 2) +
+  ggtitle("Age distribution")
+
+p_age_freq <- dat %>%
+  group_by(AGEPH) %>%
+  summarise(emp_freq = sum(nbrtotc) / sum(duree), .groups = "drop") %>%
+  ggplot(aes(x = AGEPH, y = emp_freq)) + theme_bw() +
+  geom_point(col = KULbg, alpha = .5) +
+  scale_y_continuous(labels = percent) +
+  labs(x = "AGEPH", y = "Emp. frequency", title = "Frequency by policyholder age")
+
+grid.arrange(p_age_hist, p_age_freq, ncol = 2)
+```
+
+## Empirical Severity by Age
+
+```{r emp-sev-age}
+  age_breaks <- c(18, 31.5, 54.5, 95)
+
+  freq_age <- dat %>%
+    filter(AGEPH >= 18) %>%
+    mutate(age_group = cut(AGEPH, age_breaks, right = FALSE, include.lowest = TRUE)) %>%
+    group_by(age_group) %>%
+    summarise(emp_freq = round(sum(nbrtotc) / sum(duree), 4), .groups = "drop")
+
+  sev_age <- dat %>%
+    filter(nbrtotc > 0, AGEPH >= 18) %>%
+    mutate(avg_claim = chargtot / nbrtotc,
+           age_group = cut(AGEPH, age_breaks, right = FALSE, include.lowest = TRUE)) %>%
+    group_by(age_group) %>%
+    summarise(n_claims    = n(),
+              mean_cost   = round(mean(avg_claim), 2),
+              median_cost = round(median(avg_claim), 2),
+              .groups     = "drop")
+
+  left_join(freq_age, sev_age, by = "age_group") %>%
+    kable(col.names = c("Age group", "Emp. frequency", "Policies with claims",
+                        "Mean cost (EUR)", "Median cost (EUR)"),
+          caption   = "Empirical claim frequency and average cost by age group.")
+```
+
+# Frequency Modelling
+
+## GAM
+
+### Baseline GAM with Spatial and Age Smoothers
+
+```{r gam-freq-base}
+library(mgcv)
+
+gam_freq <- gam(
+  nbrtotc ~ s(long, lat, bs = "tp") + s(AGEPH) +
+    agecar + sexp + fuelc + split + usec + fleetc + sportc + coverp + powerc +
+    offset(lnexpo),
+  family = poisson(link = "log"),
+  data   = train,
+  method = "REML"
+)
+summary(gam_freq)
+```
+
+### Spatial Smooth Effect
+
+```{r gam-freq-spatial-plot, fig.height=4}
+sp_grid <- train %>%
+  distinct(CODPOSS, long, lat) %>%
+  na.omit() %>%
+  mutate(
+    AGEPH = median(train$AGEPH, na.rm = TRUE),
+    agecar = levels(train$agecar)[1], sexp   = levels(train$sexp)[1],
+    fuelc  = levels(train$fuelc)[1],  split  = levels(train$split)[1],
+    usec   = levels(train$usec)[1],   fleetc = levels(train$fleetc)[1],
+    sportc = levels(train$sportc)[1], coverp = levels(train$coverp)[1],
+    powerc = levels(train$powerc)[1], lnexpo = 0,
+    across(c(agecar,sexp,fuelc,split,usec,fleetc,sportc,coverp,powerc), as.factor)
+  )
+
+sp_grid$fit_spatial <- predict(gam_freq, newdata = sp_grid,
+                                type = "terms", terms = "s(long,lat)")[,1]
+
+ggplot(sp_grid, aes(x = long, y = lat, colour = fit_spatial)) +
+  geom_point(size = 1.5) +
+  scale_colour_gradient2(low = "#99CCFF", mid = "white", high = "#003366",
+                         midpoint = 0, name = "Spatial\nsmooth") +
+  labs(title = "GAM spatial smooth — frequency (log scale)",
+       x = "Longitude", y = "Latitude") +
+  theme_bw()
+```
+
+### Age Smooth Effect
+
+```{r gam-freq-age-plot, fig.height=4}
+age_seq <- min(train$AGEPH, na.rm=TRUE):max(train$AGEPH, na.rm=TRUE)
+pred_age <- predict(gam_freq,
+  newdata = data.frame(
+    AGEPH  = age_seq,
+    long   = median(train$long, na.rm=TRUE),
+    lat    = median(train$lat,  na.rm=TRUE),
+    lnexpo = 0,
+    agecar = factor(levels(train$agecar)[1], levels = levels(train$agecar)),
+    sexp   = factor(levels(train$sexp)[1],   levels = levels(train$sexp)),
+    fuelc  = factor(levels(train$fuelc)[1],  levels = levels(train$fuelc)),
+    split  = factor(levels(train$split)[1],  levels = levels(train$split)),
+    usec   = factor(levels(train$usec)[1],   levels = levels(train$usec)),
+    fleetc = factor(levels(train$fleetc)[1], levels = levels(train$fleetc)),
+    sportc = factor(levels(train$sportc)[1], levels = levels(train$sportc)),
+    coverp = factor(levels(train$coverp)[1], levels = levels(train$coverp)),
+    powerc = factor(levels(train$powerc)[1], levels = levels(train$powerc))
+  ),
+  type = "terms", terms = "s(AGEPH)", se.fit = TRUE
+)
+
+df_age <- data.frame(
+  age = age_seq,
+  fit = pred_age$fit[,1],
+  lwr = pred_age$fit[,1] - qnorm(.975)*pred_age$se.fit[,1],
+  upr = pred_age$fit[,1] + qnorm(.975)*pred_age$se.fit[,1]
+)
+
+ggplot(df_age, aes(x = age)) + theme_bw() +
+  geom_line(aes(y = fit), size = 1, col = "#003366") +
+  geom_line(aes(y = lwr), size = .5, linetype = 2, col = "#99CCFF") +
+  geom_line(aes(y = upr), size = .5, linetype = 2, col = "#99CCFF") +
+  geom_vline(xintercept = c(25, 38, 55, 70), linetype = "dotted", col = "grey40") +
+  labs(title = "GAM smooth of driver age — frequency", x = "AGEPH",
+       y = expression(hat(s)(AGEPH))) +
+  theme_bw()
+```
+
+## Spatial Binning (Fisher's Natural Breaks)
+
+```{r spatial-bin-freq}
+sp_pred_full <- inspost %>%
+  na.omit() %>%
+  mutate(
+    AGEPH  = median(train$AGEPH, na.rm = TRUE),
+    lnexpo = 0,
+    agecar = factor(levels(train$agecar)[1], levels = levels(train$agecar)),
+    sexp   = factor(levels(train$sexp)[1],   levels = levels(train$sexp)),
+    fuelc  = factor(levels(train$fuelc)[1],  levels = levels(train$fuelc)),
+    split  = factor(levels(train$split)[1],  levels = levels(train$split)),
+    usec   = factor(levels(train$usec)[1],   levels = levels(train$usec)),
+    fleetc = factor(levels(train$fleetc)[1], levels = levels(train$fleetc)),
+    sportc = factor(levels(train$sportc)[1], levels = levels(train$sportc)),
+    coverp = factor(levels(train$coverp)[1], levels = levels(train$coverp)),
+    powerc = factor(levels(train$powerc)[1], levels = levels(train$powerc))
+  )
+
+sp_pred_full$fit_spatial <- predict(
+  gam_freq, newdata = sp_pred_full,
+  type = "terms", terms = "s(long,lat)"
+)[,1]
+
+bic_tbl <- data.frame(k = 2:7, BIC = NA_real_, AIC = NA_real_)
+
+for(j in seq_len(nrow(bic_tbl))){
+  k_j  <- bic_tbl$k[j]
+  ci_j <- classIntervals(sp_pred_full$fit_spatial, k_j, style = "fisher")
+
+  geo_j_sp <- cut(sp_pred_full$fit_spatial,
+                  breaks = ci_j$brks, right = FALSE,
+                  include.lowest = TRUE, dig.lab = 2)
+  lookup_j  <- data.frame(codposs = sp_pred_full$codposs, geo_j = geo_j_sp)
+  tmp       <- train %>% left_join(lookup_j, by = c("CODPOSS" = "codposs"))
+
+  gam_j <- gam(
+    nbrtotc ~ s(AGEPH) +
+      agecar + sexp + fuelc + split + usec + fleetc + sportc + coverp + powerc +
+      geo_j + offset(lnexpo),
+    family = poisson(link = "log"),
+    data   = tmp,
+    method = "REML"
+  )
+  bic_tbl$BIC[j] <- BIC(gam_j)
+  bic_tbl$AIC[j] <- AIC(gam_j)
+}
+
+num_bins <- bic_tbl$k[which.min(bic_tbl$BIC)]
+cat("BIC and AIC by number of geo bins:\n"); print(bic_tbl)
+cat("Optimal k (lowest BIC):", num_bins, "\n")
+
+ci_fisher <- classIntervals(sp_pred_full$fit_spatial, num_bins, style = "fisher")
+cat("Fisher break-points:\n"); print(round(ci_fisher$brks, 3))
+
+sp_pred_full$geo_freq <- cut(sp_pred_full$fit_spatial,
+                              breaks = ci_fisher$brks,
+                              right = FALSE, include.lowest = TRUE, dig.lab = 2)
+
+geo_lookup_freq <- sp_pred_full %>% select(codposs, geo_freq)
+train <- train %>% left_join(geo_lookup_freq, by = c("CODPOSS" = "codposs"))
+test  <- test  %>% left_join(geo_lookup_freq, by = c("CODPOSS" = "codposs"))
+
+med_class <- levels(train$geo_freq)[ceiling(num_bins / 2)]
+
+ref_geo_freq_lvl <- names(which.max(tapply(train$duree, train$geo_freq, sum)))
+train$geo_freq <- relevel(train$geo_freq, ref = ref_geo_freq_lvl)
+test$geo_freq  <- relevel(test$geo_freq,  ref = ref_geo_freq_lvl)
+cat("GLM reference geo class (most exposure):", ref_geo_freq_lvl, "\n")
+cat("Median geo class for risk profiles:", med_class, "\n")
+```
+
+```{r geo-bin-plot, fig.height=3}
+ggplot(bic_tbl, aes(x = k)) + theme_bw() +
+  geom_line(aes(y = BIC, colour = "BIC"), size = 1) +
+  geom_point(aes(y = BIC, colour = "BIC"), size = 2) +
+  geom_line(aes(y = AIC, colour = "AIC"), size = 1) +
+  geom_point(aes(y = AIC, colour = "AIC"), size = 2) +
+  geom_vline(xintercept = num_bins, linetype = "dashed", col = "grey40") +
+  scale_colour_manual(values = c(BIC = KULbg, AIC = "#003366"), name = NULL) +
+  scale_x_continuous(breaks = 2:7) +
+  labs(title = "Geo bin selection: BIC and AIC vs number of Fisher bins",
+       x = "Number of bins (k)", y = "Information criterion") +
+  theme(legend.position = "right")
+```
+
+## Geo-Adjusted GAM
+
+```{r gam-freq-geo}
+gam_freq_geo <- gam(
+  nbrtotc ~ s(AGEPH) +
+    agecar + sexp + fuelc + split + usec + fleetc + sportc + coverp + powerc +
+    geo_freq + offset(lnexpo),
+  family = poisson(link = "log"),
+  data   = train,
+  method = "REML"
+)
+summary(gam_freq_geo)
+```
+
+## Age Binning
+
+```{r age-bin-freq}
+
+getGAMdata_single <- function(model, term, var, varname){
+  pred   <- predict(model, type = "terms", terms = term)
+  dt     <- tibble(x = var, s = pred[,1])
+  dt_u   <- unique(arrange(dt, x))
+  dt_exp <- dt %>% group_by(x) %>% summarise(tot = n(), .groups = "drop")
+  left_join(dt_u, dt_exp) %>% rename(!!varname := x)
+}
+
+gam_age_data_freq <- getGAMdata_single(gam_freq_geo, "s(AGEPH)", train$AGEPH, "AGEPH")
+
+ctrl <- rpart.control(minsplit = max(20, 0.02 * nrow(gam_age_data_freq)),
+                       cp = 0.01)
+tree_age_freq <- rpart(s ~ AGEPH, data = gam_age_data_freq,
+                       weights = gam_age_data_freq$tot, control = ctrl)
+
+get_splits <- function(tree_model, all_vals){
+
+  if (is.null(tree_model$splits) || nrow(tree_model$splits) == 0)
+    return(c(min(all_vals), max(all_vals)))
+  split_vals <- sort(unique(tree_model$splits[, "index"]))
+  c(min(all_vals), split_vals, max(all_vals))
+}
+
+splits_age_freq <- get_splits(tree_age_freq, train$AGEPH)
+cat("Age cut-points (frequency):", splits_age_freq, "\n")
+
+train$AGEPH_bin_freq <- cut(train$AGEPH, splits_age_freq,
+                             right = FALSE, include.lowest = TRUE)
+test$AGEPH_bin_freq  <- cut(test$AGEPH,  splits_age_freq,
+                             right = FALSE, include.lowest = TRUE)
+
+ref_age_freq <- names(which.max(tapply(train$duree, train$AGEPH_bin_freq, sum)))
+train$AGEPH_bin_freq <- relevel(train$AGEPH_bin_freq, ref = ref_age_freq)
+test$AGEPH_bin_freq  <- relevel(test$AGEPH_bin_freq,  ref = ref_age_freq)
+cat("Reference age bin:", ref_age_freq, "\n")
+```
+
+```{r plot-age-bins-freq, fig.height=4}
+ggplot(gam_age_data_freq, aes(x = AGEPH, y = s)) + theme_bw() +
+  geom_line(size = 1, col = "#003366") +
+  geom_vline(xintercept = splits_age_freq[c(-1, -length(splits_age_freq))],
+             col = "black", linetype = "dashed") +
+  labs(title = "GAM age smooth with regression-tree cut-points (frequency)",
+       x = "AGEPH", y = expression(hat(s)(AGEPH)))
+```
+
+## Final GLM
+
+```{r glm-freq}
+glm_freq <- glm(
+  nbrtotc ~ agecar + sexp + fuelc + split + usec + fleetc + sportc + coverp + powerc +
+            geo_freq + AGEPH_bin_freq + offset(lnexpo),
+  family = poisson(link = "log"),
+  data   = train
+)
+summary(glm_freq)
+```
+
+```{r glm-freq-coef, fig.height=6}
+tidy(glm_freq, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(sig = p.value < 0.05) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate, colour = sig)) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = .3) +
+  geom_hline(yintercept = 0, linetype = "dashed", col = "grey50") +
+  coord_flip() +
+  scale_colour_manual(values = c("FALSE"="grey60","TRUE"=KULbg),
+                      name = "p < 0.05") +
+  labs(title = "Poisson GLM — coefficients (95% CI)",
+       x = NULL, y = "Log-rate coefficient") +
+  theme_bw()
+```
+
+## GBM
+
+### Hyperparameter Grid Search
+
+```{r gbm-freq-tune, cache=TRUE}
+
+train_gbm <- train %>%
+  select(nbrtotc, duree, lnexpo, AGEPH, long, lat,
+         agecar, sexp, fuelc, split, usec, fleetc, sportc, coverp, powerc) %>%
+  mutate(across(where(is.factor), as.integer)) %>%
+  na.omit()
+
+grid <- expand.grid(
+  n.trees           = c(1000, 3000),
+  shrinkage         = c(0.01, 0.005),
+  interaction.depth = c(2, 3),
+  n.minobsinnode    = c(5000, 10000),
+  bag.fraction      = c(0.7),
+  cv_deviance       = NA_real_,
+  best_trees        = NA_integer_,
+  stringsAsFactors  = FALSE
+)
+
+set.seed(42)
+for(i in seq_len(nrow(grid))){
+  m <- gbm(
+    nbrtotc ~ AGEPH + long + lat + agecar + sexp + fuelc + split + usec +
+              fleetc + sportc + coverp + powerc + offset(log(duree)),
+    data              = train_gbm,
+    distribution      = "poisson",
+    var.monotone      = rep(0, 12),
+    n.trees           = grid$n.trees[i],
+    shrinkage         = grid$shrinkage[i],
+    interaction.depth = grid$interaction.depth[i],
+    n.minobsinnode    = grid$n.minobsinnode[i],
+    bag.fraction      = grid$bag.fraction[i],
+    cv.folds          = 5,
+    keep.data         = TRUE,
+    verbose           = FALSE,
+    n.cores           = 1
+  )
+  bt <- gbm.perf(m, method = "cv", plot.it = FALSE)
+  grid$cv_deviance[i] <- m$cv.error[bt]
+  grid$best_trees[i]  <- bt
+}
+
+best_row <- which.min(grid$cv_deviance)
+cat("Best hyperparameters:\n")
+print(grid[best_row, ])
+```
+
+### Fit Best GBM
+
+```{r gbm-freq-best, cache=TRUE}
+set.seed(42)
+gbm_freq_best <- gbm(
+  nbrtotc ~ AGEPH + long + lat + agecar + sexp + fuelc + split + usec +
+            fleetc + sportc + coverp + powerc + offset(log(duree)),
+  data              = train_gbm,
+  distribution      = "poisson",
+  var.monotone      = rep(0, 12),
+  n.trees           = grid$n.trees[best_row],
+  shrinkage         = grid$shrinkage[best_row],
+  interaction.depth = grid$interaction.depth[best_row],
+  n.minobsinnode    = grid$n.minobsinnode[best_row],
+  bag.fraction      = grid$bag.fraction[best_row],
+  cv.folds          = 5,
+  keep.data         = TRUE,
+  verbose           = FALSE,
+  n.cores           = 1
+)
+best_iter_freq <- gbm.perf(gbm_freq_best, method = "cv", plot.it = TRUE)
+cat("Optimal trees:", best_iter_freq, "\n")
+```
+
+### Variable Importance
+
+```{r gbm-freq-varimp, fig.height=4}
+vi_freq <- summary(gbm_freq_best, n.trees = best_iter_freq, plotit = FALSE)
+ggplot(vi_freq, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(col = KULbg, fill = KULbg, alpha = .7) +
+  coord_flip() +
+  labs(title = "GBM Frequency — Variable Importance",
+       x = NULL, y = "Relative Influence (%)") +
+  theme_bw()
+```
+
+### ICE and PDP for Driver Age (AGEPH)
+
+```{r gbm-freq-ice-pdp, fig.height=4, cache=TRUE}
+set.seed(8711)
+
+ice_sample <- train_gbm[sample(nrow(train_gbm), 200), ]
+
+pd_age_ice <- partial(gbm_freq_best, n.trees = best_iter_freq,
+                      pred.var = "AGEPH", ice = TRUE, train = ice_sample)
+p_ice <- autoplot(
+    pd_age_ice[pd_age_ice$yhat.id %in% sample(unique(pd_age_ice$yhat.id), 100), ],
+    plot.pdp = FALSE, alpha = 0.1
+  ) + theme_bw() + labs(title = "ICE — AGEPH (frequency)", x = "AGEPH", y = "f(AGEPH)")
+
+pd_age_pdp <- partial(gbm_freq_best, n.trees = best_iter_freq,
+                        pred.var = "AGEPH", train = train_gbm)
+p_pdp <- autoplot(pd_age_pdp) +
+    theme_bw() +
+    labs(title = "PDP — AGEPH (frequency)", x = "AGEPH", y = "Avg predicted log-count")
+
+grid.arrange(p_ice, p_pdp, ncol = 2)
+```
+
+# Severity Modelling
+
+## GAM
+
+### Baseline GAM with Spatial and Age Smoothers
+
+```{r gam-sev-base}
+gam_sev <- gam(
+  avg_claim ~ s(long, lat, bs = "tp") + s(AGEPH) +
+    agecar + sexp + fuelc + split + usec + fleetc + sportc + coverp + powerc,
+  family  = Gamma(link = "log"),
+  data    = train_sev,
+  weights = train_sev$nbrtotc,
+  method  = "REML"
+)
+summary(gam_sev)
+```
+
+## Spatial Binning
+
+```{r spatial-bin-sev}
+sp_sev <- sp_pred_full %>%
+  mutate(
+    avg_claim = median(train_sev$avg_claim, na.rm = TRUE),
+    agecar = factor(levels(train$agecar)[1], levels = levels(train$agecar)),
+    sexp   = factor(levels(train$sexp)[1],   levels = levels(train$sexp)),
+    fuelc  = factor(levels(train$fuelc)[1],  levels = levels(train$fuelc)),
+    split  = factor(levels(train$split)[1],  levels = levels(train$split)),
+    usec   = factor(levels(train$usec)[1],   levels = levels(train$usec)),
+    fleetc = factor(levels(train$fleetc)[1], levels = levels(train$fleetc)),
+    sportc = factor(levels(train$sportc)[1], levels = levels(train$sportc)),
+    coverp = factor(levels(train$coverp)[1], levels = levels(train$coverp)),
+    powerc = factor(levels(train$powerc)[1], levels = levels(train$powerc)),
+    AGEPH  = median(train_sev$AGEPH, na.rm = TRUE)
+  )
+
+sp_sev$fit_spatial_sev <- predict(gam_sev, newdata = sp_sev,
+                                   type = "terms", terms = "s(long,lat)")[,1]
+
+bic_tbl_sev <- data.frame(k = 2:7, BIC = NA_real_, AIC = NA_real_)
+
+for(j in seq_len(nrow(bic_tbl_sev))){
+  k_j  <- bic_tbl_sev$k[j]
+  ci_j <- classIntervals(sp_sev$fit_spatial_sev, k_j, style = "fisher")
+
+  geo_j_sp  <- cut(sp_sev$fit_spatial_sev,
+                   breaks = ci_j$brks, right = FALSE,
+                   include.lowest = TRUE, dig.lab = 2)
+  lookup_j  <- data.frame(codposs = sp_sev$codposs, geo_sev_j = geo_j_sp)
+  tmp_sev   <- train_sev %>% left_join(lookup_j, by = c("CODPOSS" = "codposs"))
+
+  gam_j <- gam(
+    avg_claim ~ s(AGEPH) +
+      agecar + sexp + fuelc + split + usec + fleetc + sportc + coverp + powerc +
+      geo_sev_j,
+    family  = Gamma(link = "log"),
+    data    = tmp_sev,
+    weights = tmp_sev$nbrtotc,
+    method  = "REML"
+  )
+  bic_tbl_sev$BIC[j] <- BIC(gam_j)
+  bic_tbl_sev$AIC[j] <- AIC(gam_j)
+}
+
+num_bins_sev <- bic_tbl_sev$k[which.min(bic_tbl_sev$BIC)]
+cat("BIC and AIC by number of severity geo bins:\n"); print(bic_tbl_sev)
+cat("Optimal k (lowest BIC):", num_bins_sev, "\n")
+
+ci_fisher_sev <- classIntervals(sp_sev$fit_spatial_sev, num_bins_sev, style = "fisher")
+sp_sev$geo_sev <- cut(sp_sev$fit_spatial_sev,
+                       breaks = ci_fisher_sev$brks,
+                       right = FALSE, include.lowest = TRUE, dig.lab = 2)
+
+geo_lookup_sev <- sp_sev %>% select(codposs, geo_sev)
+
+train_sev <- train_sev %>% left_join(geo_lookup_sev, by = c("CODPOSS" = "codposs"))
+test_sev  <- test_sev  %>% left_join(geo_lookup_sev, by = c("CODPOSS" = "codposs"))
+train     <- train     %>% left_join(geo_lookup_sev, by = c("CODPOSS" = "codposs"))
+test      <- test      %>% left_join(geo_lookup_sev, by = c("CODPOSS" = "codposs"))
+
+med_sev <- levels(train_sev$geo_sev)[ceiling(num_bins_sev / 2)]
+
+ref_geo_sev_lvl <- names(which.max(tapply(train_sev$duree, train_sev$geo_sev, sum)))
+train_sev$geo_sev <- relevel(train_sev$geo_sev, ref = ref_geo_sev_lvl)
+test_sev$geo_sev  <- relevel(test_sev$geo_sev,  ref = ref_geo_sev_lvl)
+train$geo_sev     <- relevel(train$geo_sev,     ref = ref_geo_sev_lvl)
+test$geo_sev      <- relevel(test$geo_sev,      ref = ref_geo_sev_lvl)
+```
+
+## Geo-Adjusted GAM
+
+```{r gam-sev-geo}
+gam_sev_geo <- gam(
+  avg_claim ~ s(AGEPH) +
+    agecar + sexp + fuelc + split + usec + fleetc + sportc + coverp + powerc +
+    geo_sev,
+  family  = Gamma(link = "log"),
+  data    = train_sev,
+  weights = train_sev$nbrtotc,
+  method  = "REML"
+)
+summary(gam_sev_geo)
+```
+
+## Age Binning
+
+```{r age-bin-sev}
+gam_age_data_sev <- getGAMdata_single(gam_sev_geo, "s(AGEPH)", train_sev$AGEPH, "AGEPH")
+
+tree_age_sev <- rpart(s ~ AGEPH, data = gam_age_data_sev,
+                      weights = gam_age_data_sev$tot,
+                      control = rpart.control(minsplit = 10, cp = 0.01))
+
+splits_age_sev <- get_splits(tree_age_sev, train_sev$AGEPH)
+cat("Age cut-points (severity):", splits_age_sev, "\n")
+
+train_sev$AGEPH_bin_sev <- cut(train_sev$AGEPH, splits_age_sev,
+                                right = FALSE, include.lowest = TRUE)
+test_sev$AGEPH_bin_sev  <- cut(test_sev$AGEPH,  splits_age_sev,
+                                right = FALSE, include.lowest = TRUE)
+train$AGEPH_bin_sev <- cut(train$AGEPH, splits_age_sev,
+                            right = FALSE, include.lowest = TRUE)
+test$AGEPH_bin_sev  <- cut(test$AGEPH,  splits_age_sev,
+                            right = FALSE, include.lowest = TRUE)
+
+ref_age_sev <- names(which.max(tapply(train_sev$duree, train_sev$AGEPH_bin_sev, sum)))
+
+train_sev$AGEPH_bin_sev <- relevel(train_sev$AGEPH_bin_sev, ref = ref_age_sev)
+test_sev$AGEPH_bin_sev  <- relevel(test_sev$AGEPH_bin_sev,  ref = ref_age_sev)
+train$AGEPH_bin_sev     <- relevel(train$AGEPH_bin_sev,     ref = ref_age_sev)
+test$AGEPH_bin_sev      <- relevel(test$AGEPH_bin_sev,      ref = ref_age_sev)
+```
+
+```{r plot-age-bins-sev, fig.height=4}
+ggplot(gam_age_data_sev, aes(x = AGEPH, y = s)) + theme_bw() +
+  geom_line(size = 1, col = "#003366") +
+  geom_vline(xintercept = splits_age_sev[c(-1, -length(splits_age_sev))],
+             col = "black", linetype = "dashed") +
+  labs(title = "GAM age smooth with regression-tree cut-points (severity)",
+       x = "AGEPH", y = expression(hat(s)(AGEPH)))
+```
+
+## Final GLM
+
+```{r glm-sev}
+glm_sev <- glm(
+  avg_claim ~ agecar + sexp + fuelc + split + usec + fleetc + sportc + coverp + powerc +
+              geo_sev + AGEPH_bin_sev,
+  family  = Gamma(link = "log"),
+  data    = train_sev,
+  weights = nbrtotc
+)
+summary(glm_sev)
+```
+
+## GBM
+
+### Hyperparameter Grid Search
+
+```{r gbm-sev-setup}
+gamma_ok <- tryCatch({
+  gbm_test <- gbm(avg_claim ~ AGEPH,
+                  data = head(train_sev %>% mutate(across(where(is.factor), as.integer)), 100),
+                  distribution = "gamma", n.trees = 5, verbose = FALSE)
+  TRUE
+}, error = function(e) FALSE)
+cat("Gamma distribution available in gbm:", gamma_ok, "\n")
+if(!gamma_ok) cat("  -> Install with: devtools::install_github('harrysouthworth/gbm')\n",
+                  "  -> Falling back to Gaussian on log(avg_claim)\n")
+```
+
+```{r gbm-sev-tune, cache=TRUE}
+train_sev_gbm <- train_sev %>%
+  select(avg_claim, nbrtotc, AGEPH, long, lat,
+         agecar, sexp, fuelc, split, usec, fleetc, sportc, coverp, powerc) %>%
+  mutate(across(where(is.factor), as.integer),
+         log_avg_claim = log(avg_claim)) %>%
+  na.omit()
+
+sev_response <- if(gamma_ok) "avg_claim" else "log_avg_claim"
+sev_dist     <- if(gamma_ok) "gamma"     else "gaussian"
+
+grid_sev <- expand.grid(
+  shrinkage         = c(0.005, 0.01),
+  interaction.depth = c(1, 2, 3),
+  n.minobsinnode    = c(750, 1000, 1250),
+  bag.fraction      = c(0.7, 0.8),
+  cv_deviance       = NA_real_,
+  best_trees        = NA_integer_,
+  stringsAsFactors  = FALSE
+)
+
+sev_formula <- as.formula(paste(sev_response,
+  "~ AGEPH + long + lat + agecar + sexp + fuelc + split + usec +
+    fleetc + sportc + coverp + powerc"))
+
+set.seed(42)
+for(i in seq_len(nrow(grid_sev))){
+  m <- gbm(
+    sev_formula,
+    data              = train_sev_gbm,
+    distribution      = sev_dist,
+    weights           = train_sev_gbm$nbrtotc,
+    var.monotone      = rep(0, 12),
+    n.trees           = 1000,
+    shrinkage         = grid_sev$shrinkage[i],
+    interaction.depth = grid_sev$interaction.depth[i],
+    n.minobsinnode    = grid_sev$n.minobsinnode[i],
+    bag.fraction      = grid_sev$bag.fraction[i],
+    cv.folds          = 5,
+    keep.data         = TRUE,
+    verbose           = FALSE,
+    n.cores           = 1
+  )
+  bt <- gbm.perf(m, method = "cv", plot.it = FALSE)
+  grid_sev$cv_deviance[i] <- m$cv.error[bt]
+  grid_sev$best_trees[i]  <- bt
+}
+
+best_row_sev <- which.min(grid_sev$cv_deviance)
+cat("Best severity hyperparameters:\n")
+print(grid_sev[best_row_sev, ])
+```
+
+### Fit Best GBM
+
+```{r gbm-sev-fit, cache=TRUE}
+set.seed(42)
+gbm_sev_best <- gbm(
+  sev_formula,
+  data              = train_sev_gbm,
+  distribution      = sev_dist,
+  weights           = train_sev_gbm$nbrtotc,
+  var.monotone      = rep(0, 12),
+  n.trees           = 1000,
+  shrinkage         = grid_sev$shrinkage[best_row_sev],
+  interaction.depth = grid_sev$interaction.depth[best_row_sev],
+  n.minobsinnode    = grid_sev$n.minobsinnode[best_row_sev],
+  bag.fraction      = grid_sev$bag.fraction[best_row_sev],
+  cv.folds          = 5,
+  keep.data         = TRUE,
+  verbose           = FALSE,
+  n.cores           = 1
+)
+best_iter_sev <- gbm.perf(gbm_sev_best, method = "cv", plot.it = TRUE)
+cat("Optimal trees (severity):", best_iter_sev, "\n")
+
+if (!gamma_ok) {
+  train_log_pred <- predict(gbm_sev_best, newdata = train_sev_gbm,
+                             n.trees = best_iter_sev)
+  sigma2_sev <- var(train_sev_gbm$log_avg_claim - train_log_pred)
+  cat(sprintf("Log-normal smearing correction: σ² = %.4f  →  exp(σ²/2) = %.4f\n",
+              sigma2_sev, exp(sigma2_sev / 2)))
+}
+```
+
+### Variable Importance
+
+```{r gbm-sev-varimp, fig.height=4}
+vi_sev <- summary(gbm_sev_best, n.trees = best_iter_sev, plotit = FALSE)
+ggplot(vi_sev, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(col = KULbg, fill = KULbg, alpha = .7) +
+  coord_flip() +
+  labs(title = "GBM Severity — Variable Importance",
+       x = NULL, y = "Relative Influence (%)") +
+  theme_bw()
+```
+
+### ICE and PDP for Driver Age (AGEPH)
+
+```{r gbm-sev-ice-pdp, fig.height=4, cache=TRUE}
+set.seed(8711)
+ice_sample_sev <- train_sev_gbm[sample(nrow(train_sev_gbm), 200), ]
+
+pd_sev_ice <- partial(gbm_sev_best, n.trees = best_iter_sev,
+                      pred.var = "AGEPH", ice = TRUE, train = ice_sample_sev)
+
+p_ice_s <- autoplot(
+    pd_sev_ice[pd_sev_ice$yhat.id %in% sample(unique(pd_sev_ice$yhat.id), 100), ],
+    plot.pdp = FALSE, alpha = 0.1
+  ) + theme_bw() +
+    labs(title = "ICE — AGEPH (severity)", x = "AGEPH")
+
+pd_sev_pdp <- partial(gbm_sev_best, n.trees = best_iter_sev,
+                        pred.var = "AGEPH", train = train_sev_gbm)
+p_pdp_s <- autoplot(pd_sev_pdp) + theme_bw() +
+    labs(title = "PDP — AGEPH (severity)", x = "AGEPH")
+
+grid.arrange(p_ice_s, p_pdp_s, ncol = 2)
+
+```
+
+# Model Evaluation and Comparison
+
+## Generate Predictions
+
+```{r predictions}
+test <- test %>%
+  mutate(pred_glm_freq = predict(glm_freq, newdata = test, type = "response"))
+
+test_gbm_freq <- test %>%
+  select(nbrtotc, duree, lnexpo, AGEPH, long, lat,
+         agecar, sexp, fuelc, split, usec, fleetc, sportc, coverp, powerc) %>%
+  mutate(across(where(is.factor), as.integer)) %>%
+  replace_na(list(long = median(train$long, na.rm=TRUE),
+                  lat  = median(train$lat,  na.rm=TRUE)))
+
+test <- test %>%
+  mutate(pred_gbm_freq = predict(gbm_freq_best, newdata = test_gbm_freq,
+                                  n.trees = best_iter_freq, type = "response") * duree)
+
+test <- test %>%
+  mutate(pred_glm_sev = predict(glm_sev, newdata = test, type = "response"))
+test$pred_glm_sev[is.na(test$pred_glm_sev)] <- mean(test$pred_glm_sev, na.rm = TRUE)
+test_sev <- test_sev %>%
+  mutate(pred_glm_sev = predict(glm_sev, newdata = test_sev, type = "response"))
+
+test_sev_gbm <- test_sev %>%
+  select(avg_claim, nbrtotc, AGEPH, long, lat,
+         agecar, sexp, fuelc, split, usec, fleetc, sportc, coverp, powerc) %>%
+  mutate(across(where(is.factor), as.integer),
+         log_avg_claim = log(avg_claim)) %>%
+  replace_na(list(long = median(train_sev$long, na.rm=TRUE),
+                  lat  = median(train_sev$lat,  na.rm=TRUE)))
+
+raw_pred_sev_gbm <- predict(gbm_sev_best, newdata = test_sev_gbm,
+                             n.trees = best_iter_sev, type = "response")
+test_sev <- test_sev %>%
+  mutate(pred_gbm_sev = if(gamma_ok) raw_pred_sev_gbm else exp(raw_pred_sev_gbm + sigma2_sev / 2))
+```
+
+## Portfolio Calibration (P/O Ratio)
+
+```{r po-ratio}
+obs_total      <- sum(test$chargtot)
+pred_glm_total <- sum(test$pred_glm_freq * test$pred_glm_sev, na.rm = TRUE)
+
+po_tbl <- tibble(
+  Model = "GLM (Poisson × Gamma)",
+  `Predicted total (EUR)` = format(round(pred_glm_total), big.mark = ","),
+  `Observed total (EUR)`  = format(round(obs_total),      big.mark = ","),
+  `P/O ratio`             = round(pred_glm_total / obs_total, 3)
+)
+kable(po_tbl, caption = "Portfolio Calibration — GLM") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+## Lorenz Curve and Gini Coefficient
+
+```{r lorenz, fig.height=5}
+lorenz_df <- function(actual, predicted, exposure, label){
+  tibble(actual, predicted, exposure) %>%
+    arrange(predicted) %>%
+    mutate(
+      cum_exp    = cumsum(exposure) / sum(exposure),
+      cum_claims = cumsum(actual)   / sum(actual),
+      Model      = label
+    )
+}
+
+lc_glm <- lorenz_df(test$nbrtotc, test$pred_glm_freq, test$duree, "GLM")
+lc_gbm <- lorenz_df(test$nbrtotc, test$pred_gbm_freq, test$duree, "GBM")
+
+gini_val <- function(df){
+
+  round(2 * sum((df$cum_exp - df$cum_claims) * diff(c(0, df$cum_exp))), 4)
+}
+
+lc_all <- bind_rows(
+  lc_glm %>% mutate(Model = paste0("GLM  (G=", gini_val(lc_glm), ")")),
+  lc_gbm %>% mutate(Model = paste0("GBM  (G=", gini_val(lc_gbm), ")"))
+)
+
+ggplot(lc_all, aes(x = cum_exp, y = cum_claims, colour = Model)) +
+  geom_line(size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", col = "grey50") +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  scale_colour_manual(values = c("#003366", KULbg)) +
+  labs(title = "Lorenz Curves — Frequency Models",
+       x = "Cumulative share of exposure",
+       y = "Cumulative share of claims",
+       colour = NULL) +
+  theme_bw() +
+  theme(legend.position = c(.25, .8))
+```
+
+## Actual vs Expected (AvE) Plot
+
+```{r ave-plot, fig.height=4}
+test_ave <- test %>%
+  mutate(pure_prem_glm = pred_glm_freq * pred_glm_sev)
+
+n_bins <- 50
+df_ave <- test_ave %>%
+  mutate(pred_bin = ntile(pure_prem_glm, n_bins)) %>%
+  group_by(pred_bin) %>%
+  summarise(
+    mean_pred = mean(pure_prem_glm),
+    mean_obs  = mean(chargtot),
+    .groups   = "drop"
+  )
+
+cap99    <- quantile(abs(df_ave$mean_obs - df_ave$mean_pred), .99, na.rm = TRUE)
+df_cap   <- df_ave %>%
+  mutate(mean_obs_cap = mean_pred +
+           pmin(pmax(mean_obs - mean_pred, -cap99), cap99))
+
+p_raw <- ggplot(df_ave, aes(x = mean_pred, y = mean_obs)) + theme_bw() +
+  geom_point(col = KULbg, alpha = .6) +
+  geom_abline(slope = 1, intercept = 0, col = "red") +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "GLM Pure Premium AvE — uncapped",
+       x = "Mean predicted (EUR)", y = "Mean observed (EUR)")
+
+p_cap <- ggplot(df_cap, aes(x = mean_pred, y = mean_obs_cap)) + theme_bw() +
+  geom_point(col = KULbg, alpha = .6) +
+  geom_abline(slope = 1, intercept = 0, col = "red") +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = paste0("GLM AvE — winsorised at 99th pct (cap ≈ €",
+                      round(cap99), ")"),
+       x = "Mean predicted (EUR)", y = "Mean observed, capped (EUR)")
+
+grid.arrange(p_raw, p_cap, ncol = 2)
+```
+
+```{r ave-sev-plot, fig.height=4}
+n_bins_sev <- 20
+
+df_ave_sev <- bind_rows(
+  test_sev %>%
+    mutate(pred_bin = ntile(pred_glm_sev, n_bins_sev), Model = "GLM") %>%
+    group_by(pred_bin, Model) %>%
+    summarise(mean_pred = mean(pred_glm_sev),
+              mean_obs  = mean(avg_claim), .groups = "drop"),
+  test_sev %>%
+    mutate(pred_bin = ntile(pred_gbm_sev, n_bins_sev), Model = "GBM") %>%
+    group_by(pred_bin, Model) %>%
+    summarise(mean_pred = mean(pred_gbm_sev),
+              mean_obs  = mean(avg_claim), .groups = "drop")
+)
+
+ggplot(df_ave_sev, aes(x = mean_pred, y = mean_obs, colour = Model)) +
+  geom_point(alpha = .7) +
+  geom_abline(slope = 1, intercept = 0, col = "red") +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  scale_colour_manual(values = c(GLM = KULbg, GBM = "#003366")) +
+  labs(title = "Severity AvE — GLM vs GBM",
+       x = "Mean predicted severity (EUR)",
+       y = "Mean observed severity (EUR)") +
+  theme_bw()
+```
+
+## Double Lift Chart
+
+```{r double-lift, fig.height=4}
+test %>%
+    filter(!is.na(pred_gbm_freq) & !is.na(pred_glm_freq)) %>%
+    mutate(ratio_bin = ntile(pred_gbm_freq / pred_glm_freq, 10)) %>%
+    group_by(ratio_bin) %>%
+    summarise(
+      obs_rate  = sum(nbrtotc) / sum(duree),
+      pred_glm  = sum(pred_glm_freq) / sum(duree),
+      pred_gbm  = sum(pred_gbm_freq) / sum(duree),
+      .groups   = "drop"
+    ) %>%
+    pivot_longer(c(obs_rate, pred_glm, pred_gbm), names_to = "Source", values_to = "Rate") %>%
+    ggplot(aes(x = factor(ratio_bin), y = Rate, colour = Source, group = Source)) +
+    geom_line(size = 1) + geom_point(size = 2) +
+    scale_y_continuous(labels = percent) +
+    scale_colour_manual(values = c("black", "#003366", KULbg),
+                        labels = c("Observed", "GLM", "GBM")) +
+    labs(title = "Double Lift Chart (GBM vs GLM)",
+         x = "Decile (sorted by GBM/GLM ratio)", y = "Claim rate", colour = NULL) +
+    theme_bw()
+```
+
+# Risk Profiles
+
+```{r risk-profiles}
+ref_age_bin_freq <- ref_age_freq
+ref_age_bin_sev  <- ref_age_sev
+ref_geo_freq     <- med_class
+ref_geo_sev      <- med_sev
+
+get_age_bin <- function(age, splits, lvls) {
+  factor(as.character(cut(age, splits, right = FALSE, include.lowest = TRUE)), levels = lvls)
+  }
+
+profiles <- tribble(
+      ~profile,              ~AGEPH, ~agecar, ~sexp,   ~fuelc,   ~split,  ~usec,           ~fleetc, ~sportc, ~coverp,     ~powerc,   ~duree, ~lnexpo,
+     "Young Driver",           25,  "0-1",   "Male", "Petrol", "Once",  "Professional", "No",    "Yes",   "MTPL+++",   ">110",    1,      0,
+     "Experienced Driver",     43,  "2-5",   "Male", "Petrol", "Once",  "Private",      "No",    "No",    "MTPL+",     "66-110",  1,      0,
+     "Senior Driver",          75,  ">10",   "Male", "Petrol", "Once",  "Private",      "No",    "No",    "MTPL",      "<66",     1,      0
+    ) %>%
+  mutate(
+      agecar = factor(agecar, levels = levels(dat$agecar)),
+      sexp   = factor(sexp,   levels = levels(dat$sexp)),
+      fuelc  = factor(fuelc,  levels = levels(dat$fuelc)),
+      split  = factor(split,  levels = levels(dat$split)),
+      usec   = factor(usec,   levels = levels(dat$usec)),
+      fleetc = factor(fleetc, levels = levels(dat$fleetc)),
+      sportc = factor(sportc, levels = levels(dat$sportc)),
+      coverp = factor(coverp, levels = levels(dat$coverp)),
+      powerc = factor(powerc, levels = levels(dat$powerc)),
+      geo_freq       = factor(ref_geo_freq, levels = levels(train$geo_freq)),
+      geo_sev        = factor(ref_geo_sev,  levels = levels(train_sev$geo_sev)),
+      AGEPH_bin_freq = get_age_bin(AGEPH, splits_age_freq, levels(train$AGEPH_bin_freq)),
+      AGEPH_bin_sev  = get_age_bin(AGEPH, splits_age_sev,  levels(train_sev$AGEPH_bin_sev)),
+      long = median(dat$long, na.rm=TRUE),
+      lat  = median(dat$lat,  na.rm=TRUE)
+    )
+
+freq_glm_p <- predict(glm_freq, newdata = profiles, type = "response")
+sev_glm_p  <- predict(glm_sev,  newdata = profiles, type = "response")
+
+ profiles_gbm <- profiles %>%
+  mutate(across(where(is.factor), as.integer))
+
+freq_gbm_p <- predict(gbm_freq_best, newdata = profiles_gbm,
+                        n.trees = best_iter_freq, type = "response") * profiles$duree
+
+raw_sev_gbm_p <- predict(gbm_sev_best, newdata = profiles_gbm %>% mutate(log_avg_claim = 0),
+                          n.trees = best_iter_sev, type = "response")
+sev_gbm_p <- if(gamma_ok) raw_sev_gbm_p else exp(raw_sev_gbm_p + sigma2_sev / 2)
+
+results <- profiles %>%
+  select(profile) %>%
+  mutate(
+    `Freq — GLM`         = round(freq_glm_p,  4),
+    `Freq — GBM`         = round(freq_gbm_p,  4),
+    `Sev — GLM (EUR)`    = round(sev_glm_p,   2),
+    `Sev — GBM (EUR)`    = round(sev_gbm_p,   2),
+    `Pure Prem — GLM`    = round(freq_glm_p * sev_glm_p, 2),
+    `Pure Prem — GBM`    = round(freq_gbm_p * sev_gbm_p, 2)
+  )
+
+results %>%
+  pivot_longer(-profile) %>%
+  pivot_wider(names_from = profile) %>%
+  kable(caption = "Risk Profile Predictions") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE) %>%
+  pack_rows("Expected Frequency (per year)", 1, 2) %>%
+  pack_rows("Expected Severity (EUR | claim)", 3, 4) %>%
+  pack_rows("Expected Pure Premium (EUR/year)", 5, 6)
+```
+
+```{r profile-plot, fig.height=4}
+results %>%
+  select(profile, starts_with("Pure")) %>%
+  pivot_longer(-profile, names_to = "Model", values_to = "Pure_Premium") %>%
+  mutate(profile = factor(profile, levels = c("Young Driver", "Experienced Driver", "Senior Driver")),
+         Model   = str_remove(Model, "Pure Prem — ")) %>%
+  ggplot(aes(x = profile, y = Pure_Premium, fill = Model)) +
+  geom_col(position = "dodge", alpha = .8) +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = c(KULbg, "#003366")) +
+  labs(title = "Expected Pure Premium by Risk Profile",
+       x = NULL, y = "Pure Premium (EUR/year)", fill = "Model") +
+  theme_bw()
+```
+
+# Safety Loading
+
+```{r safety-load, cache=TRUE}
+set.seed(2025)
+N_sim <- 10000
+
+pred_freq_sl <- test$pred_glm_freq
+pred_sev_sl  <- test$pred_glm_sev
+n_sl         <- nrow(test)
+
+disp_sev  <- summary(glm_sev)$dispersion
+shape_sev <- 1 / disp_sev
+
+cat(sprintf("Estimated dispersion φ̂ = %.4f  →  shape α = %.2f\n",
+            disp_sev, shape_sev))
+
+sim_losses <- replicate(N_sim, {
+    n_i <- rpois(n_sl, pred_freq_sl)
+    idx <- which(n_i > 0)
+    if (length(idx) == 0) return(0)
+    sum(rgamma(n     = length(idx),
+               shape = n_i[idx] * shape_sev,
+               scale = pred_sev_sl[idx] / shape_sev))
+  })
+
+sim_losses <- sim_losses[is.finite(sim_losses)]
+E_S     <- mean(sim_losses)
+VaR_99  <- as.numeric(quantile(sim_losses, 0.99, na.rm = TRUE))
+TVaR_99 <- mean(sim_losses[sim_losses > VaR_99])
+theta   <- (TVaR_99 - E_S) / E_S
+
+tibble(
+  Measure = c("E[S] — mean simulated aggregate loss",
+              "VaR-99 (99th percentile)",
+              "TVaR-99 (expected shortfall at 99%)",
+              "Safety loading factor θ"),
+  Value = c(
+    paste0("€", format(round(E_S),     big.mark = ",")),
+    paste0("€", format(round(VaR_99),  big.mark = ",")),
+    paste0("€", format(round(TVaR_99), big.mark = ",")),
+    paste0(round(100 * theta, 2), "%")
+  )
+) %>%
+  kable(caption = "Monte Carlo Safety Loading — Test Portfolio (GLM, 10 000 simulations)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r safety-load-plot, fig.height=4}
+ggplot(data.frame(loss = sim_losses), aes(x = loss)) + theme_bw() +
+  geom_histogram(aes(y = after_stat(density)), bins = 80,
+                 fill = KULbg, col = KULbg, alpha = .5) +
+  geom_vline(xintercept = E_S,     col = "black",   linetype = "dotted", linewidth = .9) +
+  geom_vline(xintercept = VaR_99,  col = "red",     linetype = "dashed", linewidth = .9) +
+  geom_vline(xintercept = TVaR_99, col = "darkred", linewidth = 1.1) +
+  annotate("text", x = E_S,     y = Inf, vjust = 2,   hjust = -.1,
+           label = "E[S]",   col = "black")   +
+  annotate("text", x = VaR_99,  y = Inf, vjust = 2,   hjust = -.1,
+           label = "VaR-99",  col = "red")     +
+  annotate("text", x = TVaR_99, y = Inf, vjust = 3.5, hjust = -.1,
+           label = "TVaR-99", col = "darkred") +
+  scale_x_continuous(labels = comma) +
+  labs(title = "Simulated Portfolio Aggregate Loss Distribution (10 000 scenarios)",
+       x = "Aggregate loss (EUR)", y = "Density")
+```
+
+## Gross Premiums for Illustrative Risk Profiles
+
+```{r safety-load-profiles}
+  tibble(
+    Profile              = c("Young Driver", "Experienced Driver", "Senior Driver"),
+    `Pure Premium (EUR)` = round(freq_glm_p * sev_glm_p, 2),
+    `× (1 + θ)`         = paste0("× ", round(1 + theta, 4)),
+    `Gross Premium (EUR)`= round(freq_glm_p * sev_glm_p * (1 + theta), 2)
+  ) %>%
+    kable(caption = paste0("Gross Premiums with TVaR-99 Safety Loading  ",
+                            "(θ = ", round(100 * theta, 2), "%)")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
